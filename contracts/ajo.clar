@@ -79,6 +79,8 @@
 
 (define-public (join-group)
   (begin
+  (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+
     (asserts! (not (is-member tx-sender)) ERR-ALREADY-MEMBER)
     (asserts! (< (var-get total-members) (var-get cycle-length)) ERR-CYCLE-IN-PROGRESS)
     (map-set members tx-sender (+ (var-get total-members) u1))
@@ -96,6 +98,9 @@
 
 (define-public (contribute)
   (begin
+  (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+  (update-stats-after-contribution)
+
     (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
     (asserts! (var-get cycle-started) ERR-CYCLE-NOT-STARTED)
     (asserts! (not (has-contributed tx-sender (var-get current-cycle))) ERR-ALREADY-CONTRIBUTED)
@@ -111,6 +116,8 @@
 
 (define-public (claim-payout)
   (let ((member-id (get-member-id tx-sender)))
+  (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+
     (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
     (asserts! (var-get cycle-started) ERR-CYCLE-NOT-STARTED)
     (asserts! (is-eq member-id (var-get current-recipient)) ERR-NOT-PAYOUT-TIME)
@@ -130,7 +137,8 @@
               (var-set cycle-started false)
               true))
         (var-set current-recipient (+ (var-get current-recipient) u1)))
-    
+    (update-stats-after-payout)
+
     (ok true)))
 
 (define-public (withdraw-funds (amount uint))
@@ -148,3 +156,42 @@
     (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
     (var-set admin new-admin)
     (ok true)))
+
+
+
+
+
+(define-constant ERR-CONTRACT-PAUSED (err u113))
+
+(define-data-var contract-paused bool false)
+
+(define-read-only (is-paused)
+  (var-get contract-paused))
+
+(define-public (set-pause-state (new-state bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (var-set contract-paused new-state)
+    (ok true)))
+
+
+(define-data-var total-cycles-completed uint u0)
+(define-data-var total-contributions uint u0)
+(define-data-var total-payouts uint u0)
+
+(define-read-only (get-group-stats)
+  (ok {
+    cycles-completed: (var-get total-cycles-completed),
+    total-contributions: (var-get total-contributions),
+    total-payouts: (var-get total-payouts)
+  }))
+
+(define-private (update-stats-after-contribution)
+  (var-set total-contributions (+ (var-get total-contributions) u1)))
+
+(define-private (update-stats-after-payout)
+  (begin
+    (var-set total-payouts (+ (var-get total-payouts) u1))
+    (if (is-eq (var-get current-recipient) (var-get total-members))
+      (var-set total-cycles-completed (+ (var-get total-cycles-completed) u1))
+      true)))
