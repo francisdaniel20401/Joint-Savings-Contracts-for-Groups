@@ -26,6 +26,19 @@
 (define-map received-payout {member: principal, cycle: uint} bool)
 (define-map cycle-contributions uint uint)
 
+(define-constant ERR-CONTRIBUTION-DEADLINE-PASSED (err u114))
+(define-constant ERR-NO-PENALTIES-TO-DISTRIBUTE (err u115))
+
+(define-data-var penalty-rate uint u10)
+(define-data-var contribution-deadline uint u0)
+(define-data-var penalty-pool uint u0)
+(define-data-var per-member-bonus uint u0)
+
+
+(define-map cycle-deadlines uint uint)
+(define-map member-penalties {member: principal, cycle: uint} uint)
+(define-map on-time-contributors {cycle: uint, member: principal} bool)
+
 (define-read-only (get-admin)
   (var-get admin))
 
@@ -195,3 +208,124 @@
     (if (is-eq (var-get current-recipient) (var-get total-members))
       (var-set total-cycles-completed (+ (var-get total-cycles-completed) u1))
       true)))
+
+
+
+
+(define-read-only (get-penalty-rate)
+  (var-get penalty-rate))
+
+(define-read-only (get-contribution-deadline)
+  (var-get contribution-deadline))
+
+(define-read-only (get-penalty-pool)
+  (var-get penalty-pool))
+
+(define-read-only (get-cycle-deadline (cycle uint))
+  (default-to u0 (map-get? cycle-deadlines cycle)))
+
+(define-read-only (get-member-penalty (user principal) (cycle uint))
+  (default-to u0 (map-get? member-penalties {member: user, cycle: cycle})))
+
+(define-read-only (contributed-on-time (user principal) (cycle uint))
+  (default-to false (map-get? on-time-contributors {cycle: cycle, member: user})))
+
+(define-public (set-penalty-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= new-rate u50) ERR-INVALID-AMOUNT)
+    (var-set penalty-rate new-rate)
+    (ok true)))
+
+(define-public (set-cycle-deadline (cycle uint) (deadline uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (map-set cycle-deadlines cycle deadline)
+    (ok true)))
+
+(define-public (contribute-with-penalty)
+  (let (
+    (current-cycle-val (var-get current-cycle))
+    (deadline (get-cycle-deadline current-cycle-val))
+    (base-amount (var-get contribution-amount))
+    (is-late (> stacks-block-height deadline))
+    (penalty-amount (if is-late (/ (* base-amount (var-get penalty-rate)) u100) u0))
+    (total-amount (+ base-amount penalty-amount))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
+    (asserts! (var-get cycle-started) ERR-CYCLE-NOT-STARTED)
+    (asserts! (not (has-contributed tx-sender current-cycle-val)) ERR-ALREADY-CONTRIBUTED)
+    (asserts! (not (is-eq current-cycle-val u0)) ERR-CYCLE-COMPLETE)
+    
+    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set member-contributions {member: tx-sender, cycle: current-cycle-val} base-amount)
+    (map-set cycle-contributions current-cycle-val (+ (get-cycle-contribution current-cycle-val) base-amount))
+    
+    (if is-late
+      (begin
+        (map-set member-penalties {member: tx-sender, cycle: current-cycle-val} penalty-amount)
+        (var-set penalty-pool (+ (var-get penalty-pool) penalty-amount)))
+      (map-set on-time-contributors {cycle: current-cycle-val, member: tx-sender} true))
+    
+    (var-set total-balance (+ (var-get total-balance) base-amount))
+    (update-stats-after-contribution)
+    
+    (ok true)))
+
+(define-public (distribute-penalties (cycle uint))
+  (let (
+    (penalty-amount (var-get penalty-pool))
+    (on-time-count (count-on-time-contributors cycle))
+    ;; (per-member-bonus (if (> on-time-count u0) (/ penalty-amount on-time-count) u0))
+  )
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (> penalty-amount u0) ERR-NO-PENALTIES-TO-DISTRIBUTE)
+    ;; (asserts! (> on-time-count u0) ERR-NO-PENALTIES-TO-DISTRIBUTE)
+    
+    (var-set penalty-pool u0)
+    (var-set total-balance (+ (var-get total-balance) penalty-amount))
+    
+    (ok {
+      total-distributed: penalty-amount,
+      on-time-count: on-time-count
+    })))
+
+(define-public (claim-penalty-bonus (cycle uint))
+  (let (
+    (penalty-amount (var-get penalty-pool))
+    (on-time-count (count-on-time-contributors cycle))
+    ;; (per-member-bonus (if (> on-time-count u0) (/ penalty-amount on-time-count) u0))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
+    (asserts! (contributed-on-time tx-sender cycle) ERR-NOT-AUTHORIZED)
+    ;; (asserts! (> per-member-bonus u0) ERR-NO-PENALTIES-TO-DISTRIBUTE)
+    
+    ;; (try! (as-contract (stx-transfer? per-member-bonus tx-sender tx-sender)))
+    
+    (ok {
+      total-distributed: penalty-amount,
+      on-time-count: on-time-count
+    })))
+
+(define-private (count-on-time-contributors (cycle uint))
+  (fold count-on-time-member (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) {cycle: cycle, count: u0}))
+
+(define-private (count-on-time-member (member-id uint) (data {cycle: uint, count: uint}))
+  (let (
+    (member-principal (get-member-by-id member-id))
+    (cycle (get cycle data))
+    (current-count (get count data))
+  )
+    (if (and 
+          (is-some member-principal)
+          (contributed-on-time (unwrap-panic member-principal) cycle))
+      {cycle: cycle, count: (+ current-count u1)}
+      data)))
+
+(define-private (get-member-by-id (member-id uint))
+  (if (<= member-id (var-get total-members))
+    (some tx-sender)
+    none))
