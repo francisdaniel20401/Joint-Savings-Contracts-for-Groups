@@ -329,3 +329,270 @@
   (if (<= member-id (var-get total-members))
     (some tx-sender)
     none))
+
+(define-constant ERR-INSUFFICIENT-INTEREST-POOL (err u116))
+(define-constant ERR-INVALID-INTEREST-RATE (err u117))
+(define-constant ERR-REWARD-ALREADY-CLAIMED (err u118))
+(define-constant ERR-NO-CONTRIBUTIONS (err u119))
+(define-constant ERR-INVALID-MULTIPLIER (err u120))
+
+(define-data-var interest-pool uint u0)
+(define-data-var base-interest-rate uint u5)
+(define-data-var early-contribution-multiplier uint u2)
+(define-data-var loyalty-bonus-rate uint u3)
+(define-data-var max-interest-rate uint u15)
+(define-data-var contribution-window uint u100)
+
+(define-map member-interest-earned {member: principal, cycle: uint} uint)
+(define-map member-reward-claimed {member: principal, cycle: uint} bool)
+(define-map member-contribution-timestamp {member: principal, cycle: uint} uint)
+(define-map member-loyalty-score principal uint)
+(define-map cycle-contribution-order {cycle: uint, member: principal} uint)
+(define-map cycle-contribution-count uint uint)
+(define-map member-total-interest-earned principal uint)
+(define-map cycle-early-contributors uint uint)
+(define-map member-consecutive-cycles principal uint)
+
+(define-read-only (get-interest-pool)
+  (var-get interest-pool))
+
+(define-read-only (get-base-interest-rate)
+  (var-get base-interest-rate))
+
+(define-read-only (get-early-contribution-multiplier)
+  (var-get early-contribution-multiplier))
+
+(define-read-only (get-loyalty-bonus-rate)
+  (var-get loyalty-bonus-rate))
+
+(define-read-only (get-max-interest-rate)
+  (var-get max-interest-rate))
+
+(define-read-only (get-contribution-window)
+  (var-get contribution-window))
+
+(define-read-only (get-member-interest-earned (member principal) (cycle uint))
+  (default-to u0 (map-get? member-interest-earned {member: member, cycle: cycle})))
+
+(define-read-only (get-member-reward-claimed (member principal) (cycle uint))
+  (default-to false (map-get? member-reward-claimed {member: member, cycle: cycle})))
+
+(define-read-only (get-member-contribution-timestamp (member principal) (cycle uint))
+  (default-to u0 (map-get? member-contribution-timestamp {member: member, cycle: cycle})))
+
+(define-read-only (get-member-loyalty-score (member principal))
+  (default-to u0 (map-get? member-loyalty-score member)))
+
+(define-read-only (get-cycle-contribution-order (cycle uint) (member principal))
+  (default-to u0 (map-get? cycle-contribution-order {cycle: cycle, member: member})))
+
+(define-read-only (get-cycle-contribution-count (cycle uint))
+  (default-to u0 (map-get? cycle-contribution-count cycle)))
+
+(define-read-only (get-member-total-interest-earned (member principal))
+  (default-to u0 (map-get? member-total-interest-earned member)))
+
+(define-read-only (get-cycle-early-contributors (cycle uint))
+  (default-to u0 (map-get? cycle-early-contributors cycle)))
+
+(define-read-only (get-member-consecutive-cycles (member principal))
+  (default-to u0 (map-get? member-consecutive-cycles member)))
+
+(define-public (set-interest-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= new-rate u50) ERR-INVALID-INTEREST-RATE)
+    (var-set base-interest-rate new-rate)
+    (ok true)))
+
+(define-public (set-early-contribution-multiplier (new-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= new-multiplier u1) (<= new-multiplier u5)) ERR-INVALID-MULTIPLIER)
+    (var-set early-contribution-multiplier new-multiplier)
+    (ok true)))
+
+(define-public (set-loyalty-bonus-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= new-rate u20) ERR-INVALID-INTEREST-RATE)
+    (var-set loyalty-bonus-rate new-rate)
+    (ok true)))
+
+(define-public (set-contribution-window (new-window uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (> new-window u10) ERR-INVALID-AMOUNT)
+    (var-set contribution-window new-window)
+    (ok true)))
+
+(define-public (fund-interest-pool (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set interest-pool (+ (var-get interest-pool) amount))
+    (ok true)))
+
+(define-public (contribute-with-interest)
+  (let (
+    (current-cycle-val (var-get current-cycle))
+    (contribution-order (+ (get-cycle-contribution-count current-cycle-val) u1))
+    (is-early (< contribution-order (/ (var-get total-members) u2)))
+    (consecutive-cycles (get-member-consecutive-cycles tx-sender))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
+    (asserts! (var-get cycle-started) ERR-CYCLE-NOT-STARTED)
+    (asserts! (not (has-contributed tx-sender current-cycle-val)) ERR-ALREADY-CONTRIBUTED)
+    (asserts! (not (is-eq current-cycle-val u0)) ERR-CYCLE-COMPLETE)
+    
+    (try! (stx-transfer? (var-get contribution-amount) tx-sender (as-contract tx-sender)))
+    
+    (map-set member-contributions {member: tx-sender, cycle: current-cycle-val} (var-get contribution-amount))
+    (map-set cycle-contributions current-cycle-val (+ (get-cycle-contribution current-cycle-val) (var-get contribution-amount)))
+    (map-set member-contribution-timestamp {member: tx-sender, cycle: current-cycle-val} stacks-block-height)
+    (map-set cycle-contribution-order {cycle: current-cycle-val, member: tx-sender} contribution-order)
+    (map-set cycle-contribution-count current-cycle-val contribution-order)
+    
+    (if is-early
+      (map-set cycle-early-contributors current-cycle-val (+ (get-cycle-early-contributors current-cycle-val) u1))
+      true)
+    
+    (map-set member-consecutive-cycles tx-sender (+ consecutive-cycles u1))
+    (begin
+      (unwrap-panic (update-loyalty-score tx-sender))
+      (unwrap-panic (calculate-and-store-interest tx-sender current-cycle-val))
+    
+      (var-set total-balance (+ (var-get total-balance) (var-get contribution-amount)))
+      (update-stats-after-contribution)
+    
+      (ok true))))
+
+(define-public (claim-interest-reward (cycle uint))
+  (let (
+    (earned-interest (get-member-interest-earned tx-sender cycle))
+    (already-claimed (get-member-reward-claimed tx-sender cycle))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
+    (asserts! (> earned-interest u0) ERR-NO-CONTRIBUTIONS)
+    (asserts! (not already-claimed) ERR-REWARD-ALREADY-CLAIMED)
+    (asserts! (>= (var-get interest-pool) earned-interest) ERR-INSUFFICIENT-INTEREST-POOL)
+    
+    (try! (as-contract (stx-transfer? earned-interest tx-sender tx-sender)))
+    
+    (map-set member-reward-claimed {member: tx-sender, cycle: cycle} true)
+    (var-set interest-pool (- (var-get interest-pool) earned-interest))
+    (map-set member-total-interest-earned tx-sender (+ (get-member-total-interest-earned tx-sender) earned-interest))
+    
+    (ok earned-interest)))
+
+(define-public (calculate-cycle-interest (cycle uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (> cycle u0) ERR-INVALID-AMOUNT)
+    (unwrap-panic (calculate-all-member-interest cycle))
+    (ok true)))
+
+(define-private (calculate-and-store-interest (member principal) (cycle uint))
+  (let (
+    (base-contribution (var-get contribution-amount))
+    (contribution-order (get-cycle-contribution-order cycle member))
+    (is-early (< contribution-order (/ (var-get total-members) u2)))
+    (loyalty-score (get-member-loyalty-score member))
+    (consecutive-cycles (get-member-consecutive-cycles member))
+    (base-interest-amount (/ (* base-contribution (var-get base-interest-rate)) u100))
+    (early-bonus (if is-early (/ (* base-interest-amount (var-get early-contribution-multiplier)) u1) u0))
+    (loyalty-bonus (/ (* base-interest-amount (if (<= loyalty-score u10) loyalty-score u10)) u10))
+    (consecutive-bonus (/ (* base-interest-amount (if (<= consecutive-cycles u5) consecutive-cycles u5)) u10))
+    (total-interest (if (<= (+ base-interest-amount early-bonus loyalty-bonus consecutive-bonus) 
+                           (/ (* base-contribution (var-get max-interest-rate)) u100))
+                       (+ base-interest-amount early-bonus loyalty-bonus consecutive-bonus)
+                       (/ (* base-contribution (var-get max-interest-rate)) u100)))
+  )
+    (map-set member-interest-earned {member: member, cycle: cycle} total-interest)
+    (ok total-interest)))
+
+(define-private (update-loyalty-score (member principal))
+  (let (
+    (current-score (get-member-loyalty-score member))
+    (new-score (if (<= (+ current-score u1) u10) (+ current-score u1) u10))
+  )
+    (map-set member-loyalty-score member new-score)
+    (ok new-score)))
+
+(define-private (calculate-all-member-interest (cycle uint))
+  (let (
+    (member-list (list tx-sender))
+  )
+    (map calculate-member-interest-wrapper member-list)
+    (ok true)))
+
+(define-private (calculate-member-interest-wrapper (member principal))
+  (if (has-contributed member (var-get current-cycle))
+    (calculate-and-store-interest member (var-get current-cycle))
+    (ok u0)))
+
+(define-read-only (get-member-interest-projection (member principal) (cycle uint))
+  (let (
+    (base-contribution (var-get contribution-amount))
+    (contribution-order (get-cycle-contribution-order cycle member))
+    (is-early (< contribution-order (/ (var-get total-members) u2)))
+    (loyalty-score (get-member-loyalty-score member))
+    (consecutive-cycles (get-member-consecutive-cycles member))
+    (base-interest-amount (/ (* base-contribution (var-get base-interest-rate)) u100))
+    (early-bonus (if is-early (/ (* base-interest-amount (var-get early-contribution-multiplier)) u1) u0))
+    (loyalty-bonus (/ (* base-interest-amount (if (<= loyalty-score u10) loyalty-score u10)) u10))
+    (consecutive-bonus (/ (* base-interest-amount (if (<= consecutive-cycles u5) consecutive-cycles u5)) u10))
+    (total-interest (if (<= (+ base-interest-amount early-bonus loyalty-bonus consecutive-bonus) 
+                           (/ (* base-contribution (var-get max-interest-rate)) u100))
+                       (+ base-interest-amount early-bonus loyalty-bonus consecutive-bonus)
+                       (/ (* base-contribution (var-get max-interest-rate)) u100)))
+  )
+    {
+      base-interest: base-interest-amount,
+      early-bonus: early-bonus,
+      loyalty-bonus: loyalty-bonus,
+      consecutive-bonus: consecutive-bonus,
+      total-interest: total-interest,
+      is-early: is-early
+    }))
+
+(define-read-only (get-member-interest-summary (member principal))
+  (let (
+    (current-cycle-val (var-get current-cycle))
+    (total-earned (get-member-total-interest-earned member))
+    (loyalty-score (get-member-loyalty-score member))
+    (consecutive-cycles (get-member-consecutive-cycles member))
+    (current-cycle-earned (get-member-interest-earned member current-cycle-val))
+    (can-claim (and (> current-cycle-earned u0) 
+                   (not (get-member-reward-claimed member current-cycle-val))))
+  )
+    {
+      total-interest-earned: total-earned,
+      loyalty-score: loyalty-score,
+      consecutive-cycles: consecutive-cycles,
+      current-cycle-earned: current-cycle-earned,
+      can-claim: can-claim
+    }))
+
+(define-read-only (get-interest-pool-status)
+  (let (
+    (pool-balance (var-get interest-pool))
+    (estimated-rewards (calculate-estimated-cycle-rewards))
+  )
+    {
+      pool-balance: pool-balance,
+      estimated-rewards: estimated-rewards,
+      sustainability-ratio: (if (> estimated-rewards u0) (/ pool-balance estimated-rewards) u0)
+    }))
+
+(define-private (calculate-estimated-cycle-rewards)
+  (let (
+    (total-members-count (var-get total-members))
+    (avg-contribution (var-get contribution-amount))
+    (avg-interest-rate (var-get base-interest-rate))
+    (estimated-total (/ (* avg-contribution avg-interest-rate total-members-count) u100))
+  )
+    estimated-total))
