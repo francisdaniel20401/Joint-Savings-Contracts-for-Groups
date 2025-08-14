@@ -596,3 +596,238 @@
     (estimated-total (/ (* avg-contribution avg-interest-rate total-members-count) u100))
   )
     estimated-total))
+
+;; Group Governance System - Democratic decision making for AJO groups
+(define-constant ERR-INVALID-PROPOSAL-TYPE (err u121))
+(define-constant ERR-PROPOSAL-NOT-FOUND (err u122))
+(define-constant ERR-PROPOSAL-EXPIRED (err u123))
+(define-constant ERR-PROPOSAL-NOT-ACTIVE (err u124))
+(define-constant ERR-ALREADY-VOTED (err u125))
+(define-constant ERR-INSUFFICIENT-QUORUM (err u126))
+(define-constant ERR-PROPOSAL-REJECTED (err u127))
+(define-constant ERR-INVALID-VOTING-PERIOD (err u128))
+
+;; Proposal types: 1=change-contribution-amount, 2=change-penalty-rate, 3=change-admin, 4=emergency-withdrawal
+(define-data-var next-proposal-id uint u1)
+(define-data-var voting-period uint u1008) ;; Default 1 week in blocks
+(define-data-var quorum-percentage uint u60) ;; 60% of members needed for quorum
+
+;; Proposal structure mapping
+(define-map proposals uint {
+  proposer: principal,
+  proposal-type: uint,
+  target-value: uint,
+  target-principal: (optional principal),
+  description: (string-ascii 256),
+  created-at: uint,
+  voting-deadline: uint,
+  yes-votes: uint,
+  no-votes: uint,
+  executed: bool,
+  active: bool
+})
+
+;; Track member votes on proposals
+(define-map member-votes {proposal-id: uint, member: principal} bool)
+
+;; Track voting participation
+(define-map member-voting-history principal uint)
+
+;; Read-only functions for governance
+(define-read-only (get-voting-period)
+  (var-get voting-period))
+
+(define-read-only (get-quorum-percentage)
+  (var-get quorum-percentage))
+
+(define-read-only (get-next-proposal-id)
+  (var-get next-proposal-id))
+
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? proposals proposal-id))
+
+(define-read-only (get-member-vote (proposal-id uint) (member principal))
+  (map-get? member-votes {proposal-id: proposal-id, member: member}))
+
+(define-read-only (get-member-voting-history (member principal))
+  (default-to u0 (map-get? member-voting-history member)))
+
+(define-read-only (calculate-quorum-needed)
+  (/ (* (var-get total-members) (var-get quorum-percentage)) u100))
+
+(define-read-only (get-proposal-status (proposal-id uint))
+  (match (map-get? proposals proposal-id)
+    proposal (let (
+      (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+      (quorum-needed (calculate-quorum-needed))
+      (is-expired (> stacks-block-height (get voting-deadline proposal)))
+      (has-quorum (>= total-votes quorum-needed))
+      (is-passing (> (get yes-votes proposal) (get no-votes proposal)))
+    )
+    (some {
+      proposal: proposal,
+      total-votes: total-votes,
+      quorum-needed: quorum-needed,
+      has-quorum: has-quorum,
+      is-expired: is-expired,
+      is-passing: is-passing,
+      can-execute: (and has-quorum is-passing (not (get executed proposal)))
+    }))
+    none))
+
+;; Admin governance configuration
+(define-public (set-voting-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= new-period u144) (<= new-period u4032)) ERR-INVALID-VOTING-PERIOD) ;; 1 day to 4 weeks
+    (var-set voting-period new-period)
+    (ok true)))
+
+(define-public (set-quorum-percentage (new-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= new-percentage u25) (<= new-percentage u100)) ERR-INVALID-AMOUNT)
+    (var-set quorum-percentage new-percentage)
+    (ok true)))
+
+;; Create new proposal - any member can propose
+(define-public (create-proposal (proposal-type uint) (target-value uint) (target-principal (optional principal)) (description (string-ascii 256)))
+  (let (
+    (proposal-id (var-get next-proposal-id))
+    (voting-deadline (+ stacks-block-height (var-get voting-period)))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
+    (asserts! (and (>= proposal-type u1) (<= proposal-type u4)) ERR-INVALID-PROPOSAL-TYPE)
+    
+    (map-set proposals proposal-id {
+      proposer: tx-sender,
+      proposal-type: proposal-type,
+      target-value: target-value,
+      target-principal: target-principal,
+      description: description,
+      created-at: stacks-block-height,
+      voting-deadline: voting-deadline,
+      yes-votes: u0,
+      no-votes: u0,
+      executed: false,
+      active: true
+    })
+    
+    (var-set next-proposal-id (+ proposal-id u1))
+    (ok proposal-id)))
+
+;; Vote on proposal - true for yes, false for no
+(define-public (vote-on-proposal (proposal-id uint) (vote bool))
+  (let (
+    (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+    (member-previous-vote (map-get? member-votes {proposal-id: proposal-id, member: tx-sender}))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
+    (asserts! (get active proposal) ERR-PROPOSAL-NOT-ACTIVE)
+    (asserts! (<= stacks-block-height (get voting-deadline proposal)) ERR-PROPOSAL-EXPIRED)
+    (asserts! (is-none member-previous-vote) ERR-ALREADY-VOTED)
+    
+    ;; Record the vote
+    (map-set member-votes {proposal-id: proposal-id, member: tx-sender} vote)
+    
+    ;; Update vote counts
+    (if vote
+      (map-set proposals proposal-id (merge proposal {yes-votes: (+ (get yes-votes proposal) u1)}))
+      (map-set proposals proposal-id (merge proposal {no-votes: (+ (get no-votes proposal) u1)})))
+    
+    ;; Update member voting history
+    (map-set member-voting-history tx-sender (+ (get-member-voting-history tx-sender) u1))
+    
+    (ok true)))
+
+;; Execute approved proposal
+(define-public (execute-proposal (proposal-id uint))
+  (let (
+    (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+    (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+    (quorum-needed (calculate-quorum-needed))
+    (has-quorum (>= total-votes quorum-needed))
+    (is-passing (> (get yes-votes proposal) (get no-votes proposal)))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (get active proposal) ERR-PROPOSAL-NOT-ACTIVE)
+    (asserts! (not (get executed proposal)) ERR-PROPOSAL-REJECTED)
+    (asserts! has-quorum ERR-INSUFFICIENT-QUORUM)
+    (asserts! is-passing ERR-PROPOSAL-REJECTED)
+    
+    ;; Execute based on proposal type
+    (if (is-eq (get proposal-type proposal) u1)
+      ;; Change contribution amount
+      (var-set contribution-amount (get target-value proposal))
+      (if (is-eq (get proposal-type proposal) u2)
+        ;; Change penalty rate
+        (var-set penalty-rate (get target-value proposal))
+        (if (is-eq (get proposal-type proposal) u3)
+          ;; Change admin
+          (match (get target-principal proposal)
+            new-admin (var-set admin new-admin)
+            false)
+          (if (is-eq (get proposal-type proposal) u4)
+            ;; Emergency withdrawal
+            (try! (as-contract (stx-transfer? (get target-value proposal) tx-sender (var-get admin))))
+            false))))
+    
+    ;; Mark proposal as executed
+    (map-set proposals proposal-id (merge proposal {executed: true, active: false}))
+    
+    (ok true)))
+
+;; Cancel proposal (only proposer or admin)
+(define-public (cancel-proposal (proposal-id uint))
+  (let (
+    (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (or (is-eq tx-sender (get proposer proposal)) (is-eq tx-sender (var-get admin))) ERR-NOT-AUTHORIZED)
+    (asserts! (get active proposal) ERR-PROPOSAL-NOT-ACTIVE)
+    (asserts! (not (get executed proposal)) ERR-PROPOSAL-REJECTED)
+    
+    (map-set proposals proposal-id (merge proposal {active: false}))
+    (ok true)))
+
+;; Get active proposals
+(define-read-only (get-active-proposals-count)
+  (fold count-active-proposals (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20) u0))
+
+(define-private (count-active-proposals (proposal-id uint) (count uint))
+  (match (map-get? proposals proposal-id)
+    proposal (if (and (get active proposal) (<= stacks-block-height (get voting-deadline proposal)))
+               (+ count u1)
+               count)
+    count))
+
+;; Get governance statistics
+(define-read-only (get-governance-stats)
+  (let (
+    (total-proposals (- (var-get next-proposal-id) u1))
+    (active-proposals (get-active-proposals-count))
+  )
+  {
+    total-proposals: total-proposals,
+    active-proposals: active-proposals,
+    quorum-needed: (calculate-quorum-needed),
+    voting-period-blocks: (var-get voting-period)
+  }))
+
+;; Helper function to get proposal history for a member
+(define-read-only (get-member-governance-summary (member principal))
+  (let (
+    (proposals-participated (get-member-voting-history member))
+    (is-active-member (is-member member))
+  )
+  {
+    proposals-participated: proposals-participated,
+    is-active-member: is-active-member,
+    voting-power: (if is-active-member u1 u0)
+  }))
+
+
+
+  
