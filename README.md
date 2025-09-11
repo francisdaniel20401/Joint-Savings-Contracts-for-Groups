@@ -76,6 +76,68 @@ The Ajo smart contract implements a digital version of the traditional African t
 - `ERR-INVALID-CYCLE-LENGTH (u111)`: Invalid cycle length
 - `ERR-INVALID-CONTRIBUTION-AMOUNT (u112)`: Invalid contribution amount
 
+## 🚨 Emergency Fund System
+
+The Ajo contract now includes a comprehensive emergency fund system that provides a safety net for group members facing unexpected financial hardships.
+
+### Features
+
+- **Voluntary Contributions**: Members can contribute to the emergency fund to build a collective safety net
+- **Democratic Loan Approval**: Group members vote on emergency loan requests to ensure responsible lending
+- **Flexible Repayment**: Borrowers can repay loans at their own pace with no interest charges
+- **Eligibility Requirements**: Members must have participated in at least 3 cycles to be eligible
+- **Fund Protection**: Maximum loan amounts are capped at 30% of the emergency fund balance
+
+### Emergency Fund Functions
+
+#### Member Functions
+- `contribute-to-emergency-fund(amount)`: Add funds to the emergency pool
+- `request-emergency-loan(amount, reason)`: Request an emergency loan with justification
+- `vote-on-loan(loan-id, approve)`: Vote to approve or reject loan requests
+- `repay-loan(loan-id, amount)`: Make repayments on approved loans
+
+#### Admin Functions
+- `set-emergency-fund-params(max-loan-pct, min-tenure, approval-threshold)`: Configure fund parameters
+- `finalize-loan-approval(loan-id)`: Process loan approval after voting
+- `disburse-loan(loan-id)`: Transfer approved loan to borrower
+
+#### Read-Only Functions
+- `get-emergency-fund-balance()`: Check current fund balance
+- `get-emergency-loan(loan-id)`: View loan details
+- `is-member-eligible-for-loan(member)`: Check if member can request loans
+- `get-loan-status(loan-id)`: Get comprehensive loan voting and approval status
+- `calculate-max-loan-amount()`: See maximum loan amount available
+
+### Loan Process Workflow
+
+1. **Request**: Eligible member requests emergency loan with reason
+2. **Voting**: Other group members vote to approve/reject the request
+3. **Approval**: Admin finalizes approval if 60% of members support the loan
+4. **Disbursement**: Approved loan funds are transferred to borrower
+5. **Repayment**: Borrower repays loan gradually, replenishing the fund for others
+
+### Example Usage
+
+#### Contributing to Emergency Fund
+```clarity
+(contract-call? .ajo contribute-to-emergency-fund u500000) ;; 0.5 STX
+```
+
+#### Requesting Emergency Loan
+```clarity
+(contract-call? .ajo request-emergency-loan u1000000 "Medical emergency")
+```
+
+#### Voting on Loan Request
+```clarity
+(contract-call? .ajo vote-on-loan u1 true) ;; Approve loan #1
+```
+
+#### Making Loan Repayment
+```clarity
+(contract-call? .ajo repay-loan u1 u200000) ;; Repay 0.2 STX
+```
+
 ## 🔗 Testing
 
 Use Clarinet console to test the contract functions:
@@ -90,4 +152,6 @@ Example test sequence:
 3. Start the cycle
 4. Make contributions
 5. Claim payouts
+6. Contribute to emergency fund
+7. Request and approve emergency loans
 

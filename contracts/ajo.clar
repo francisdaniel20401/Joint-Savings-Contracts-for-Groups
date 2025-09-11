@@ -606,11 +606,26 @@
 (define-constant ERR-INSUFFICIENT-QUORUM (err u126))
 (define-constant ERR-PROPOSAL-REJECTED (err u127))
 (define-constant ERR-INVALID-VOTING-PERIOD (err u128))
+(define-constant ERR-EMERGENCY-LOAN-NOT-FOUND (err u129))
+(define-constant ERR-LOAN-ALREADY-APPROVED (err u130))
+(define-constant ERR-INSUFFICIENT-EMERGENCY-FUND (err u131))
+(define-constant ERR-MEMBER-NOT-ELIGIBLE (err u132))
+(define-constant ERR-LOAN-AMOUNT-EXCEEDED (err u133))
+(define-constant ERR-LOAN-NOT-APPROVED (err u134))
+(define-constant ERR-LOAN-ALREADY_DISBURSED (err u135))
 
 ;; Proposal types: 1=change-contribution-amount, 2=change-penalty-rate, 3=change-admin, 4=emergency-withdrawal
 (define-data-var next-proposal-id uint u1)
 (define-data-var voting-period uint u1008) ;; Default 1 week in blocks
 (define-data-var quorum-percentage uint u60) ;; 60% of members needed for quorum
+
+;; Emergency Fund System Variables
+(define-data-var emergency-fund-balance uint u0)
+(define-data-var next-loan-id uint u1)
+(define-data-var max-loan-percentage uint u30) ;; 30% of total contributions
+(define-data-var emergency-fund-allocation-rate uint u5) ;; 5% of interest goes to emergency fund
+(define-data-var min-membership-tenure uint u3) ;; 3 cycles minimum to be eligible
+(define-data-var loan-approval-threshold uint u60) ;; 60% approval needed
 
 ;; Proposal structure mapping
 (define-map proposals uint {
@@ -632,6 +647,26 @@
 
 ;; Track voting participation
 (define-map member-voting-history principal uint)
+
+;; Emergency Fund System Maps
+(define-map emergency-loans uint {
+  borrower: principal,
+  amount: uint,
+  reason: (string-ascii 256),
+  requested-at: uint,
+  approval-votes: uint,
+  rejection-votes: uint,
+  approved: bool,
+  disbursed: bool,
+  remaining-balance: uint,
+  repayment-schedule: uint, ;; blocks per payment
+  total-repaid: uint,
+  last-payment: uint
+})
+
+(define-map loan-votes {loan-id: uint, member: principal} bool)
+(define-map member-loan-history principal uint)
+(define-map member-emergency-fund-contributions principal uint)
 
 ;; Read-only functions for governance
 (define-read-only (get-voting-period)
@@ -828,6 +863,211 @@
     voting-power: (if is-active-member u1 u0)
   }))
 
+;; === EMERGENCY FUND SYSTEM ===
 
+;; Fund the emergency pool through voluntary contributions
+(define-public (contribute-to-emergency-fund (amount uint))
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set emergency-fund-balance (+ (var-get emergency-fund-balance) amount))
+    (map-set member-emergency-fund-contributions tx-sender (+ (get-member-emergency-fund-contributions tx-sender) amount))
+    (ok true)))
 
-  
+;; Request an emergency loan
+(define-public (request-emergency-loan (amount uint) (reason (string-ascii 256)))
+  (let (
+    (loan-id (var-get next-loan-id))
+    (member-tenure (get-member-consecutive-cycles tx-sender))
+    (max-loan-amount (/ (* (var-get emergency-fund-balance) (var-get max-loan-percentage)) u100))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
+    (asserts! (>= member-tenure (var-get min-membership-tenure)) ERR-MEMBER-NOT-ELIGIBLE)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (<= amount max-loan-amount) ERR-LOAN-AMOUNT-EXCEEDED)
+    (asserts! (>= (var-get emergency-fund-balance) amount) ERR-INSUFFICIENT-EMERGENCY-FUND)
+    
+    (map-set emergency-loans loan-id {
+      borrower: tx-sender,
+      amount: amount,
+      reason: reason,
+      requested-at: stacks-block-height,
+      approval-votes: u0,
+      rejection-votes: u0,
+      approved: false,
+      disbursed: false,
+      remaining-balance: amount,
+      repayment-schedule: u1008, ;; Weekly payments
+      total-repaid: u0,
+      last-payment: u0
+    })
+    
+    (var-set next-loan-id (+ loan-id u1))
+    (map-set member-loan-history tx-sender (+ (get-member-loan-history tx-sender) u1))
+    (ok loan-id)))
+
+;; Vote on emergency loan approval
+(define-public (vote-on-loan (loan-id uint) (approve bool))
+  (let (
+    (loan (unwrap! (map-get? emergency-loans loan-id) ERR-EMERGENCY-LOAN-NOT-FOUND))
+    (existing-vote (map-get? loan-votes {loan-id: loan-id, member: tx-sender}))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
+    (asserts! (not (get approved loan)) ERR-LOAN-ALREADY-APPROVED)
+    (asserts! (not (get disbursed loan)) ERR-LOAN-ALREADY_DISBURSED)
+    (asserts! (is-none existing-vote) ERR-ALREADY-VOTED)
+    (asserts! (not (is-eq tx-sender (get borrower loan))) ERR-NOT-AUTHORIZED) ;; Borrower cannot vote
+    
+    (map-set loan-votes {loan-id: loan-id, member: tx-sender} approve)
+    
+    (if approve
+      (map-set emergency-loans loan-id (merge loan {approval-votes: (+ (get approval-votes loan) u1)}))
+      (map-set emergency-loans loan-id (merge loan {rejection-votes: (+ (get rejection-votes loan) u1)})))
+    
+    (ok true)))
+
+;; Make loan repayment
+(define-public (repay-loan (loan-id uint) (amount uint))
+  (let (
+    (loan (unwrap! (map-get? emergency-loans loan-id) ERR-EMERGENCY-LOAN-NOT-FOUND))
+    (remaining-balance (get remaining-balance loan))
+    (repayment-amount (if (<= amount remaining-balance) amount remaining-balance))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-eq tx-sender (get borrower loan)) ERR-NOT-AUTHORIZED)
+    (asserts! (get disbursed loan) ERR-LOAN-NOT-APPROVED)
+    (asserts! (> remaining-balance u0) ERR-INSUFFICIENT-FUNDS)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    
+    (try! (stx-transfer? repayment-amount tx-sender (as-contract tx-sender)))
+    
+    (var-set emergency-fund-balance (+ (var-get emergency-fund-balance) repayment-amount))
+    (map-set emergency-loans loan-id (merge loan {
+      remaining-balance: (- remaining-balance repayment-amount),
+      total-repaid: (+ (get total-repaid loan) repayment-amount),
+      last-payment: stacks-block-height
+    }))
+    
+    (ok repayment-amount)))
+
+;; Admin function to set emergency fund parameters
+(define-public (set-emergency-fund-params (max-loan-pct uint) (min-tenure uint) (approval-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= max-loan-pct u50) ERR-INVALID-AMOUNT) ;; Max 50% of fund
+    (asserts! (>= min-tenure u1) ERR-INVALID-AMOUNT)
+    (asserts! (and (>= approval-threshold u25) (<= approval-threshold u100)) ERR-INVALID-AMOUNT)
+    (var-set max-loan-percentage max-loan-pct)
+    (var-set min-membership-tenure min-tenure)
+    (var-set loan-approval-threshold approval-threshold)
+    (ok true)))
+
+;; === EMERGENCY FUND READ-ONLY FUNCTIONS ===
+
+(define-read-only (get-emergency-fund-balance)
+  (var-get emergency-fund-balance))
+
+(define-read-only (get-emergency-fund-params)
+  {
+    fund-balance: (var-get emergency-fund-balance),
+    max-loan-percentage: (var-get max-loan-percentage),
+    min-membership-tenure: (var-get min-membership-tenure),
+    loan-approval-threshold: (var-get loan-approval-threshold)
+  })
+
+(define-read-only (get-emergency-loan (loan-id uint))
+  (map-get? emergency-loans loan-id))
+
+(define-read-only (get-member-emergency-fund-contributions (member principal))
+  (default-to u0 (map-get? member-emergency-fund-contributions member)))
+
+(define-read-only (get-member-loan-history (member principal))
+  (default-to u0 (map-get? member-loan-history member)))
+
+(define-read-only (get-loan-vote (loan-id uint) (member principal))
+  (map-get? loan-votes {loan-id: loan-id, member: member}))
+
+(define-read-only (calculate-max-loan-amount)
+  (/ (* (var-get emergency-fund-balance) (var-get max-loan-percentage)) u100))
+
+(define-read-only (is-member-eligible-for-loan (member principal))
+  (let (
+    (member-tenure (get-member-consecutive-cycles member))
+    (min-required (var-get min-membership-tenure))
+  )
+    (and (is-member member) (>= member-tenure min-required))))
+
+(define-read-only (get-loan-status (loan-id uint))
+  (match (map-get? emergency-loans loan-id)
+    loan (let (
+      (total-votes (+ (get approval-votes loan) (get rejection-votes loan)))
+      (approval-threshold (/ (* (var-get total-members) (var-get loan-approval-threshold)) u100))
+      (has-quorum (>= total-votes approval-threshold))
+      (is-approved-by-votes (>= (get approval-votes loan) approval-threshold))
+    )
+    (some {
+      loan: loan,
+      total-votes: total-votes,
+      approval-threshold: approval-threshold,
+      has-quorum: has-quorum,
+      is-approved-by-votes: is-approved-by-votes,
+      is-fully-repaid: (is-eq (get remaining-balance loan) u0)
+    }))
+    none))
+
+(define-read-only (get-emergency-fund-stats)
+  (let (
+    (total-loans (- (var-get next-loan-id) u1))
+    (fund-balance (var-get emergency-fund-balance))
+    (max-loan (calculate-max-loan-amount))
+  )
+  {
+    total-loans-requested: total-loans,
+    current-fund-balance: fund-balance,
+    max-loan-amount: max-loan,
+    utilization-rate: (if (> fund-balance u0) (/ (* max-loan u100) fund-balance) u0)
+  }))
+
+;; Check and approve loan if threshold met
+(define-public (finalize-loan-approval (loan-id uint))
+  (let (
+    (loan (unwrap! (map-get? emergency-loans loan-id) ERR-EMERGENCY-LOAN-NOT-FOUND))
+    (total-votes (+ (get approval-votes loan) (get rejection-votes loan)))
+    (approval-threshold (/ (* (var-get total-members) (var-get loan-approval-threshold)) u100))
+    (is-approved (>= (get approval-votes loan) approval-threshold))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (>= total-votes approval-threshold) ERR-INSUFFICIENT-QUORUM)
+    (asserts! (not (get approved loan)) ERR-LOAN-ALREADY-APPROVED)
+    (asserts! (not (get disbursed loan)) ERR-LOAN-ALREADY_DISBURSED)
+    
+    (if is-approved
+      (map-set emergency-loans loan-id (merge loan {approved: true}))
+      false)
+    
+    (ok is-approved)))
+
+;; Disburse approved loan
+(define-public (disburse-loan (loan-id uint))
+  (let (
+    (loan (unwrap! (map-get? emergency-loans loan-id) ERR-EMERGENCY-LOAN-NOT-FOUND))
+    (loan-amount (get amount loan))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (get approved loan) ERR-LOAN-NOT-APPROVED)
+    (asserts! (not (get disbursed loan)) ERR-LOAN-ALREADY_DISBURSED)
+    (asserts! (>= (var-get emergency-fund-balance) loan-amount) ERR-INSUFFICIENT-EMERGENCY-FUND)
+    
+    (try! (as-contract (stx-transfer? loan-amount tx-sender (get borrower loan))))
+    
+    (var-set emergency-fund-balance (- (var-get emergency-fund-balance) loan-amount))
+    (map-set emergency-loans loan-id (merge loan {
+      disbursed: true,
+      last-payment: stacks-block-height
+    }))
+    
+    (ok true)))
